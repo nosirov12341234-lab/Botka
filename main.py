@@ -1,170 +1,201 @@
 import telebot
 import sqlite3
+from datetime import datetime
 
-# --- ASOSIY SOZLAMALAR ---
+# --- SOZLAMALAR ---
 TOKEN = "8220266826:AAEdkHlhdJmi2HWMrANe9Ch-ky5vIDkkNxY"
 ADMIN_ID = 8215108926
 bot = telebot.TeleBot(TOKEN)
 
-# --- BAZANI SOZLASH ---
+# --- BAZA BILAN ISHLASH ---
 def init_db():
-    conn = sqlite3.connect('mega_bot.db')
+    conn = sqlite3.connect('bonus_bot.db', check_same_thread=False)
     cursor = conn.cursor()
-    # Foydalanuvchilar jadvali
     cursor.execute('''CREATE TABLE IF NOT EXISTS users 
-                      (user_id INTEGER PRIMARY KEY, referrer_id INTEGER, ref_count INTEGER DEFAULT 0)''')
-    # Kanallar jadvali
-    cursor.execute('CREATE TABLE IF NOT EXISTS channels (channel_id TEXT PRIMARY KEY)')
-    # Darajalar jadvali (AUTOINCREMENT xatosi tuzatildi)
-    cursor.execute('''CREATE TABLE IF NOT EXISTS levels 
-                      (level_id INTEGER PRIMARY KEY AUTOINCREMENT, req_count INTEGER, photo_id TEXT, description TEXT)''')
+                      (user_id INTEGER PRIMARY KEY, referrer_id INTEGER, balance INTEGER DEFAULT 0, status TEXT DEFAULT 'pending')''')
+    cursor.execute('CREATE TABLE IF NOT EXISTS channels (id TEXT PRIMARY KEY)')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS prizes 
+                      (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, cost INTEGER, photo TEXT, gender TEXT)''')
     conn.commit()
-    conn.close()
+    return conn
 
-# Kanallarni olish
-def get_channels():
-    conn = sqlite3.connect('mega_bot.db', check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute("SELECT channel_id FROM channels")
-    ch = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return ch
+db = init_db()
 
-# Obunani tekshirish
+# Kanallarni tekshirish
 def check_sub(user_id):
-    channels = get_channels()
-    if not channels: return True # Kanal yo'q bo'lsa o'tkazib yuboradi
+    cursor = db.cursor()
+    cursor.execute("SELECT id FROM channels")
+    channels = cursor.fetchall()
+    if not channels: return True
     for ch in channels:
         try:
-            status = bot.get_chat_member(ch, user_id).status
+            status = bot.get_chat_member(ch[0], user_id).status
             if status in ['left', 'kicked']: return False
-        except: continue
+        except:
+            bot.send_message(ADMIN_ID, f"⚠️ Diqqat: Bot {ch[0]} kanalida admin emas!")
+            return False
     return True
 
-# --- ASOSIY START ---
+# --- ASOSIY MENYU ---
+def main_menu(user_id):
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add("🎁 Sovg'alar", "💰 Ballarim va ID")
+    markup.add("🔗 Do'stlarni taklif qilish", "📸 Rasm orqali buyurtma")
+    markup.add("📞 Admin bilan bog'lanish")
+    if user_id == ADMIN_ID: markup.add("⚙️ Admin Panel")
+    return markup
+
 @bot.message_handler(commands=['start'])
 def start(message):
-    user_id = message.from_user.id
+    u_id = message.from_user.id
     args = message.text.split()
+    ref_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
     
-    conn = sqlite3.connect('mega_bot.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    user = cursor.fetchone()
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM users WHERE user_id=?", (u_id,))
+    if not cursor.fetchone():
+        cursor.execute("INSERT INTO users (user_id, referrer_id, status) VALUES (?, ?, 'pending')", (u_id, ref_id))
+        db.commit()
 
-    if not user:
-        referrer = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
-        cursor.execute("INSERT INTO users (user_id, referrer_id) VALUES (?, ?)", (user_id, referrer))
-        conn.commit()
-    conn.close()
-
-    if check_sub(user_id):
-        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-        markup.add("🎁 Sovrinli o'yin", "🛍 Xaridni boshlash")
-        markup.add("👨‍💻 Admin bilan bog'lanish", "📊 Statistika")
-        if user_id == ADMIN_ID: markup.add("⚙️ Admin Panel")
-        bot.send_message(user_id, "Xaridni boshlang tugmasini bosib xarid qilishingiz mumkin. Shuningdek, sovrinli o'yinimizda qatnashishingizni istardik!", reply_markup=markup)
+    if check_sub(u_id):
+        bot.send_message(u_id, "Xush kelibsiz! Ballar to'plang va sovg'alarga ega bo'ling.", reply_markup=main_menu(u_id))
     else:
-        show_sub_channels(user_id)
+        show_sub_channels(u_id)
 
 def show_sub_channels(user_id):
-    channels = get_channels()
+    cursor = db.cursor()
+    cursor.execute("SELECT id FROM channels")
     markup = telebot.types.InlineKeyboardMarkup()
-    for ch in channels:
-        markup.add(telebot.types.InlineKeyboardButton("Kanalga a'zo bo'lish", url=f"https://t.me/{ch[1:]}"))
-    markup.add(telebot.types.InlineKeyboardButton("✅ Tekshirish", callback_data="check_sub"))
-    bot.send_message(user_id, "Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling:", reply_markup=markup)
+    for row in cursor.fetchall():
+        markup.add(telebot.types.InlineKeyboardButton("Kanalga a'zo bo'lish", url=f"https://t.me/{row[0][1:]}"))
+    markup.add(telebot.types.InlineKeyboardButton("✅ Tasdiqlash", callback_data="check_sub_status"))
+    bot.send_message(user_id, "Xarid qilish va sovg'alar yutish uchun kanallarga a'zo bo'ling:", reply_markup=markup)
+
+# --- TASDIQLASH (REFERAL TIZIMI LOGIKASI) ---
+@bot.callback_query_handler(func=lambda call: call.data == "check_sub_status")
+def check_callback(call):
+    u_id = call.from_user.id
+    if check_sub(u_id):
+        cursor = db.cursor()
+        cursor.execute("SELECT referrer_id, status FROM users WHERE user_id=?", (u_id,))
+        res = cursor.fetchone()
+        
+        if res and res[1] == 'pending':
+            ref_id = res[0]
+            if ref_id:
+                cursor.execute("UPDATE users SET balance = balance + 5 WHERE user_id=?", (ref_id,))
+                bot.send_message(ref_id, "✅ Yangi do'stingiz kanallarga qo'shildi! Sizga +5 ball berildi.")
+            
+            cursor.execute("UPDATE users SET status = 'active' WHERE user_id=?", (u_id,))
+            db.commit()
+        
+        bot.delete_message(u_id, call.message.message_id)
+        bot.send_message(u_id, "Tabriklaymiz! Endi botdan to'liq foydalanishingiz mumkin.", reply_markup=main_menu(u_id))
+    else:
+        bot.answer_callback_query(call.id, "Siz hali kanallarga a'zo emassiz!", show_alert=True)
+
+# --- SOVG'ALAR (ERKAK/AYOL) ---
+@bot.message_handler(func=lambda m: m.text == "🎁 Sovg'alar")
+def gender_menu(message):
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("👨 Erkaklar uchun", callback_data="p_Erkak"),
+               telebot.types.InlineKeyboardButton("👩 Ayollar uchun", callback_data="p_Ayol"))
+    bot.send_message(message.chat.id, "Kategoriyani tanlang:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("p_"))
+def show_prizes(call):
+    gender = call.data.split("_")[1]
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM prizes WHERE gender=?", (gender,))
+    items = cursor.fetchall()
+    if not items:
+        bot.answer_callback_query(call.id, "Hozircha bu bo'limda sovg'alar yo'q.")
+        return
+    for item in items:
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton(f"🔄 Almashtirish ({item[2]} ball)", callback_data=f"exchange_{item[0]}"))
+        bot.send_photo(call.message.chat.id, item[3], caption=f"🎁 {item[1]}\n💰 Narxi: {item[2]} ball", reply_markup=markup)
+
+# --- AYIRBOSHLASH ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("exchange_"))
+def exchange(call):
+    p_id = call.data.split("_")[1]
+    u_id = call.from_user.id
+    cursor = db.cursor()
+    cursor.execute("SELECT balance FROM users WHERE user_id=?", (u_id,))
+    bal = cursor.fetchone()[0]
+    cursor.execute("SELECT * FROM prizes WHERE id=?", (p_id,))
+    prize = cursor.fetchone()
+
+    if bal >= prize[2]:
+        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (prize[2], u_id))
+        db.commit()
+        bot.send_message(u_id, "✅ Ayirboshlash muvaffaqiyatli! Qo'shimcha ma'lumot uchun admin sizga bog'lanadi.")
+        bot.send_photo(ADMIN_ID, prize[3], caption=f"📣 SOVRIN ALMASHTIRILDI!\n👤 Kim: @{call.from_user.username}\n🆔 ID: {u_id}\n🎁 Sovrin: {prize[1]}")
+    else:
+        bot.answer_callback_query(call.id, "Ballaringiz yetarli emas!", show_alert=True)
+
+# --- RASM ORQALI BUYURTMA ---
+@bot.message_handler(func=lambda m: m.text == "📸 Rasm orqali buyurtma")
+def photo_order(message):
+    msg = bot.send_message(message.chat.id, "Buyurtma qilmoqchi bo'lgan mahsulotingiz rasmini yuboring:")
+    bot.register_next_step_handler(msg, forward_order)
+
+def forward_order(message):
+    if message.content_type == 'photo':
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
+        bot.send_message(ADMIN_ID, f"📸 YANGI BUYURTMA (RASM)\n👤 Kimdan: @{message.from_user.username}\n🆔 ID: `{message.from_user.id}`\n📅 Sana: {now}")
+        bot.send_message(message.chat.id, "Rasmingiz adminga yuborildi. Tez orada bog'lanamiz!")
+    else:
+        bot.send_message(message.chat.id, "Iltimos, faqat rasm yuboring.")
+
+# --- BALLAR VA TAKLIF ---
+@bot.message_handler(func=lambda m: m.text == "💰 Ballarim va ID")
+def balance(message):
+    cursor = db.cursor()
+    cursor.execute("SELECT balance FROM users WHERE user_id=?", (message.from_user.id,))
+    bal = cursor.fetchone()[0]
+    bot.send_message(message.chat.id, f"👤 Sizning ID: `{message.from_user.id}`\n💰 To'plangan ballar: {bal} ball", parse_mode="Markdown")
+
+@bot.message_handler(func=lambda m: m.text == "🔗 Do'stlarni taklif qilish")
+def invite(message):
+    link = f"https://t.me/{bot.get_me().username}?start={message.from_user.id}"
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("📤 Havolani ulashish", url=f"https://t.me/share/url?url={link}&text=Zo'r bot ekan, do'stlar taklif qilib sovg'alar yutib ol!"))
+    bot.send_message(message.chat.id, f"Do'stlaringizni taklif qiling va har biri uchun 5 ball oling!\n\nLink: {link}", reply_markup=markup)
 
 # --- ADMIN PANEL ---
 @bot.message_handler(func=lambda m: m.text == "⚙️ Admin Panel" and m.from_user.id == ADMIN_ID)
 def admin_panel(message):
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("➕ Kanal qo'shish", callback_data="add_channel"))
-    markup.add(telebot.types.InlineKeyboardButton("🏆 Daraja qo'shish", callback_data="add_level"))
+    markup.add(telebot.types.InlineKeyboardButton("➕ Kanal qo'shish", callback_data="a_ch"),
+               telebot.types.InlineKeyboardButton("🎁 Sovg'a qo'shish", callback_data="a_pr"))
     bot.send_message(ADMIN_ID, "Boshqaruv paneli:", reply_markup=markup)
 
-@bot.callback_query_handler(func=lambda call: call.data == "add_channel")
-def add_ch_prompt(call):
-    msg = bot.send_message(ADMIN_ID, "Kanal linkini yuboring (Masalan: @kanal_nomi):")
-    bot.register_next_step_handler(msg, save_channel)
+@bot.callback_query_handler(func=lambda call: call.data == "a_ch")
+def add_ch(call):
+    msg = bot.send_message(ADMIN_ID, "Kanal linkini yuboring (@kanal):")
+    bot.register_next_step_handler(msg, save_ch)
 
-def save_channel(message):
-    conn = sqlite3.connect('mega_bot.db')
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO channels (channel_id) VALUES (?)", (message.text,))
-    conn.commit()
-    conn.close()
-    bot.send_message(ADMIN_ID, "Kanal saqlandi!")
+def save_ch(message):
+    db.cursor().execute("INSERT OR IGNORE INTO channels VALUES (?)", (message.text,))
+    db.commit()
+    bot.send_message(ADMIN_ID, "Kanal qo'shildi!")
 
-@bot.callback_query_handler(func=lambda call: call.data == "add_level")
-def add_lvl_prompt(call):
-    msg = bot.send_message(ADMIN_ID, "Necha referal kerak? (Masalan: 5):")
-    bot.register_next_step_handler(msg, get_lvl_count)
+@bot.callback_query_handler(func=lambda call: call.data == "a_pr")
+def add_pr(call):
+    msg = bot.send_message(ADMIN_ID, "Nomi, Narxi, Jinsi (Erkak/Ayol). Namuna: Soat, 100, Erkak")
+    bot.register_next_step_handler(msg, get_pr)
 
-def get_lvl_count(message):
-    count = message.text
-    msg = bot.send_message(ADMIN_ID, "Sovrin rasmini yuboring:")
-    bot.register_next_step_handler(msg, get_lvl_photo, count)
+def get_pr(message):
+    data = message.text.split(", ")
+    msg = bot.send_message(ADMIN_ID, "Rasmini yuboring:")
+    bot.register_next_step_handler(msg, save_pr, data)
 
-def get_lvl_photo(message, count):
-    if message.content_type == 'photo':
-        photo_id = message.photo[-1].file_id
-        msg = bot.send_message(ADMIN_ID, "Sovrin haqida izoh yozing:")
-        bot.register_next_step_handler(msg, save_level, count, photo_id)
-    else:
-        bot.send_message(ADMIN_ID, "Rasm yubormadingiz!")
+def save_pr(message, data):
+    db.cursor().execute("INSERT INTO prizes (name, cost, photo, gender) VALUES (?, ?, ?, ?)", (data[0], int(data[1]), message.photo[-1].file_id, data[2]))
+    db.commit()
+    bot.send_message(ADMIN_ID, "Sovg'a saqlandi!")
 
-def save_level(message, count, photo_id):
-    conn = sqlite3.connect('mega_bot.db')
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO levels (req_count, photo_id, description) VALUES (?, ?, ?)", (int(count), photo_id, message.text))
-    conn.commit()
-    conn.close()
-    bot.send_message(ADMIN_ID, "Daraja qo'shildi!")
-
-@bot.message_handler(func=lambda m: m.text == "🎁 Sovrinli o'yin")
-def show_levels(message):
-    user_id = message.from_user.id
-    conn = sqlite3.connect('mega_bot.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT req_count, photo_id, description FROM levels ORDER BY req_count ASC")
-    levels = cursor.fetchall()
-    cursor.execute("SELECT ref_count FROM users WHERE user_id=?", (user_id,))
-    my_refs = cursor.fetchone()[0]
-    conn.close()
-
-    link = f"https://t.me/{(bot.get_me()).username}?start={user_id}"
-    bot.send_message(user_id, f"📊 Referallaringiz: {my_refs}\n🔗 Link: {link}")
-
-    for lvl in levels:
-        bot.send_photo(user_id, lvl[1], caption=f"🎯 Maqsad: {lvl[0]} ta do'st\n📝 {lvl[2]}")
-
-@bot.callback_query_handler(func=lambda call: call.data == "check_sub")
-def check_callback(call):
-    user_id = call.from_user.id
-    if check_sub(user_id):
-        conn = sqlite3.connect('mega_bot.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT referrer_id FROM users WHERE user_id=?", (user_id,))
-        res = cursor.fetchone()
-        if res and res[0]:
-            ref_id = res[0]
-            cursor.execute("UPDATE users SET ref_count = ref_count + 1 WHERE user_id=?", (ref_id,))
-            conn.commit()
-            
-            cursor.execute("SELECT ref_count FROM users WHERE user_id=?", (ref_id,))
-            new_count = cursor.fetchone()[0]
-            cursor.execute("SELECT req_count FROM levels WHERE req_count=?", (new_count,))
-            if cursor.fetchone():
-                bot.send_message(ADMIN_ID, f"🔔 Sovrin! @{bot.get_chat(ref_id).username} ({ref_id}) {new_count} taga yetdi!")
-        conn.close()
-        bot.delete_message(user_id, call.message.message_id)
-        start(call.message)
-    else:
-        bot.answer_callback_query(call.id, "Kanalga a'zo bo'ling!", show_alert=True)
-
-if __name__ == "__main__":
-    init_db()
-    print("Bot ishlamoqda...")
-    bot.infinity_polling()
-  
+bot.infinity_polling()
